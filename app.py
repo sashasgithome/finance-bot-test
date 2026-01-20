@@ -1,163 +1,126 @@
-# File: app.py 
-# Description : handles main ordered chatbot logic and LLM interaction related to user financial queries
+# File: ui.py 
+# Description : shows streamlit UI, allows for input of CIP ID, displays chatbot --> allows for user interaction
 
-import os
 import streamlit as st
-import json
-from datetime import datetime
-from langchain_google_genai import ChatGoogleGenerativeAI
+from prefilter import load_data, filter_by_cif, get_custom_category_list, get_customer_details
+from process import GeminiAgent, validate_query, get_query_params, execute_query, generate_final_response
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- CONFIGURATION 
-class GeminiAgent:
-    def __init__(self):
-        self.name = "Gemini"
-        #self.model = "gemini-2.5-flash"
-        self.model = "gemini-2.5-flash-lite"
-        #self.model = "gemini-3-flash"
+# --- INITIAL CONFIG
+st.set_page_config(page_title="BNI AI Assistant Prototype", page_icon="🏦", layout="wide")
+model = GeminiAgent().llm
 
-        self.llm = ChatGoogleGenerativeAI(
-            model=self.model,
-            google_api_key=os.getenv("GOOGLE_API_KEY"),
-        )
-
-# --- PRE-STEP: INPUT QUERY VALIDATION
-@st.cache_data
-def validate_query(user_query, _model):
-    """Checks if user input can be answered by the finance bot. Handles out-of-scope queries."""
-
-    system_prompt = f"""
-
-    CONTEXT:
-    You are an 'Intelligent and Helpful Customer Assistant Bot' for Bank Nasional Indonesia (BNI). 
-    Your assistant capabilities are limited to : counting amount of transactions, checking total spending, or listing any trasactions.
-    Your customer sends a query : {user_query}
-
-    TASK: 
-    1. If query is within your capabilities, return the string "VALID" only.
-    2. If query is related to finance/banking but outside your capabilities list, return a polite sentence clarifying your limitations.  
-    3. If query is unrelated to finance/banking, return a polite sentence explaining your specific role as a finance assistant only.
-    """
-
-    response = _model.invoke(system_prompt).content.strip()
-    return response
-
-# --- STEP 1: DATA-QUERY GENERATION
-@st.cache_data
-def get_query_params(user_query, category_list, _model):
-    """Translates user query in natural language into structured parameters for data filtering and retrieval."""
-
-    system_prompt = f"""
-
-    CONTEXT:
-    Today is {datetime.now().strftime('%Y-%m-%d')}. You must convert the user query into a JSON object for filtering a pandas dataframe.
-    CATEGORIES: {category_list}
-    USER QUERY: {user_query}
-
-    TASK: Translate the user query into the following parameters.
-    - operation: one of "sum", "count", "max", or "list". 
-    --- Example: "sum" for total spending, "count" for number of transactions.
-    - category_id: The numerical Category ID from the CATEGORIES list, must be an integer. Choose closest related.
-    - search_terms: A list of keywords to search for, must not be empty.
-    --- if query not in English, adjust to English unless for institution / brand names.
-    --- add terms from USER QUERY that relate to merchants, brands, or spending types.
-    --- add RELEVANT words from the CATEGORIES list that definitely relates and can help answer user query. 
-    - start_date: The start date in "YYYY-MM-DD" format, default to one year ago if not specified.
-    - end_date: The end date in "YYYY-MM-DD" format, default to today if not specified.
+# --- SIDEBAR: CIF LOGIN & CATEGORY VIEW
+with st.sidebar:
+    st.title("Customer Portal")
     
-    JSON SCHEMA (English language only):
-    {{
-        "operation": "sum" | "count" | "max" | "list",
-        "category_id": int | null,
-        "search_terms": [string] | [],
-        "start_date": "YYYY-MM-DD",
-        "end_date": "YYYY-MM-DD"
-    }}
-    """
+    # Get customer's unique CIF
+    cif_id = st.text_input("Enter Customer Information File (CIF) ID:", placeholder="e.g., 123456")
+    
+    if cif_id:
 
-    try:
-        response = _model.invoke(system_prompt).content
-        clean_json = response.replace('```json', '').replace('```', '').strip()
+        # Filter data for the specific user first
+        raw_df = load_data("resources/transactions.csv")
+        user_df = filter_by_cif(raw_df, cif_id)
         
-        # Fallback
-        if not clean_json:
-            return {"operation": "list", "category": "all"}
-        return json.loads(clean_json)
+        if user_df.empty:
+            st.error(f"No transactions found for CIF ID {cif_id}.")
+        else:
+            st.success(f"CIF {cif_id} successfully verified.")
+
+            # Retrieve customer name and language preference
+            if "user_name" not in st.session_state or "user_lang" not in st.session_state:
+                profile_df = load_data("resources/customer_profiles.csv")
+                name, lang = get_customer_details(cif_id, profile_df)
+                st.session_state.user_name = name
+                st.session_state.user_lang = lang
+    
+            if st.session_state.user_lang == "id" : st.success(f"Selamat datang, {st.session_state.user_name}! Ada yang bisa saya bantu terkait keuangan Anda hari ini?") 
+            else : st.success(f"Welcome, {st.session_state.user_name}! What financial insights can I assist you with today?")
+            
+            # Show system-made categories for the particular user
+            if "category_list" not in st.session_state:
+                if st.session_state.user_lang == "id" : text = f"Mohon tunggu sebentar. Sedang menganalisis pola pengeluaran dan transaksi CIF {cif_id}..."
+                else : text = f"Please wait. Currently analyzing spending patterns of CIF {cif_id}..."
+
+                with st.spinner(text):
+                    cat_list = get_custom_category_list(user_df, model)
+                    st.session_state.category_list = cat_list
+                    st.session_state.current_cif = cif_id
+                    st.session_state.user_df = user_df
+            
+            with st.expander("Finalized System Categorization", expanded=True):
+                st.caption(f"Transactions of CIF ID {cif_id} have been categorized as the following:")
+                st.text(st.session_state.category_list)
+    else:
+        st.error("Please enter valid CIF ID.")
+
+    st.divider()
+    if st.button("Reset Session"):
+        st.session_state.messages = []
+        st.rerun()
+
+# --- MAIN UI: CHATBOT
+st.title("🏦 BNI Personal Finance Assistant")
+
+if not cif_id or user_df.empty:
+    st.info("Please enter a valid CIF in the sidebar to access your financial insights.")
+    st.stop()
+
+# Show the chatbot interface
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Ask about your spending..."):
+
+    # Add user message to history
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.spinner("Preparing your financial insights..."):
+
+        # Validate the user query
+        validation = validate_query(prompt, model)
+        if validation != "VALID":
+            full_response = validation
+
+            with st.chat_message("assistant"):
+                st.markdown(full_response)
+                
+        else:
+            # Planner: Convert text to JSON using the identified categories
+            params = get_query_params(prompt, st.session_state.category_list, model)
+            
+            # Executor: Filter the user_df based on LLM parameters
+            context = execute_query(st.session_state.user_name, st.session_state.user_lang, st.session_state.user_df, params)
+            
+            # Polisher: Format the final response with context
+            full_response = generate_final_response(prompt, context, model)
         
-    except json.JSONDecodeError:
-        print("Failed to decode JSON from LLM")
-        return {"operation": "list", "category": "all"}
-    
-    except Exception as e:
-        print(f"API Error: {e}")
-        return {"operation": "list", "category": "all"}
+            # Assistant Response
+            with st.chat_message("assistant"):
+                st.markdown(full_response)
+                
+                with st.expander("SEE CHATBOT LOGIC DETAILS"):
+                    st.write("**LLM Reasoning (JSON Params):**")
+                    st.json(params)
+                    st.write(f"**Data Grounding:** Found {context['transaction_count']} transactions totaling Rp {context['total_spend']:,}")
 
-# --- STEP 2: RELEVANT DATA RETRIEVAL
-def execute_query(user_name, user_lang, df, params):
-    """Query execution to fetch relevant data after multi-step filtering process."""
-
-    relevant_df = df.copy()
-    
-    # Filter by parameters in the order of category group, date range, then 'search terms'
-    if params.get("category_id"):
-        relevant_df = relevant_df[relevant_df['category_by_system'] == params['category_id']]
-    
-    if params.get("start_date") and params.get("end_date"):
-        relevant_df = relevant_df[(relevant_df['trx_date'] >= params['start_date']) & (relevant_df['trx_date'] <= params['end_date'])]
-
-    if params.get("search_terms"):
-        pattern = '|'.join(params['search_terms'])
-        
-        # Search across subheader and notes
-        text_mask = relevant_df['subheader'].str.contains(pattern, case=False, na=False) | \
-                    relevant_df['notes'].str.contains(pattern, case=False, na=False) 
-        relevant_df = relevant_df[text_mask]
-    
-    # Order relevant transactions data by most recent
-    relevant_df = relevant_df.sort_values(by='trx_date', ascending=False)
-    relevant_data_amount = len(relevant_df)
-
-    # Retrieve context for relevant transactions, limit to 10 (that gets listed) if more are found
-    selected_columns = ['trx_date', 'subheader', 'detail_information', 'notes', 'amount', 'debit_credit']
-    available_cols = [col for col in selected_columns if col in relevant_df.columns]
-
-    if relevant_data_amount > 10:
-        recent_transactions = relevant_df[available_cols].head(10).to_dict(orient="records")
-    recent_transactions = relevant_df[available_cols].to_dict(orient="records")
-
-    # Return structured results
-    return {
-        "user_name": user_name,
-        "user_lang": user_lang,
-        "total_spend": relevant_df['amount'].sum(),
-        "transaction_count": relevant_data_amount,
-        "transaction_data": recent_transactions
-    }
-
-# --- STEP 3: ANSWER POLISHER
-@st.cache_data
-def generate_final_response(user_query, context, _model):
-    """Answer-polishing process by feeding LLM with relevant data (as context) and original user query."""
-
-    polisher_prompt = f"""
-    You are an 'Intelligent Customer Assistant', a helpful and professional financial bot for customer named {context['user_name']}.
-    
-    USER QUERY: "{user_query}"
-    
-    INPUT DATA:
-    - Total Amount: Rp {context['total_spend']:,}
-    - Number of Transactions: {context['transaction_count']}
-    - Recent Details: {context['transaction_data']}
-
-    GOAL:
-    1. Answer the user's question directly and clearly, in {context['user_lang']} language with professional yet friendly tone.
-    2. Provide helpful insight only if you are sure, such as largest transactions or spending trends. If no data is found, politely inform.
-    5. Always format currency in Rupiah.
-    
-    STRICT RULE: Only use INPUT DATA provided above. Do not hallucinate transactions.
-    """
-    
-    response = _model.invoke(polisher_prompt).content.strip()
-    return response
+                    if context['transaction_data']:
+                        st.write("**Transactions given as LLM Context:**")
+                        st.dataframe(
+                            context['transaction_data'], 
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    else:
+                        st.info("No individual transaction records were found for this query.")
+            
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
