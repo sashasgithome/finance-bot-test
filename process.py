@@ -1,4 +1,4 @@
-# File: app.py 
+# File: process.py
 # Description : handles main ordered chatbot logic and LLM interaction related to user financial queries
 
 import os

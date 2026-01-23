@@ -1,4 +1,4 @@
-# File: ui.py 
+# File: app.py 
 # Description : shows streamlit UI, allows for input of CIP ID, displays chatbot --> allows for user interaction
 
 import streamlit as st
